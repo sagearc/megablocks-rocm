@@ -112,4 +112,4 @@ class LearnedRouter(torch.nn.Module):
                 self.args.moe_num_experts,
             ) if self.args.uniform_expert_assignment else expert_indices
         )
-        return scores, expert_weights, expert_indices
+        return scores, logits, expert_weights, expert_indices
