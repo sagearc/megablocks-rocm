@@ -30,13 +30,23 @@ def clear_load_balancing_loss():
 
 
 def batched_load_balancing_loss(args: Arguments):
+    # When zloss is configured we always return a 2-tuple (lb, zloss); otherwise
+    # we preserve the upstream single-value contract for backward compatibility.
+    return_zloss = args.moe_zloss_weight > 0
     if args.moe_loss_weight == 0:
-        return 0.0, 0.0
+        return (0.0, 0.0) if return_zloss else 0.0
 
+    saved = get_load_balancing_loss()
+    # When zloss is on, save_load_balancing_loss stores 3-tuples (tokens, scores, logits);
+    # otherwise it stores 2-tuples (tokens, scores).
     # tokens_per_expert[i].shape = (num_experts)
     # expert_scores[i].shape = (tokens, num_experts)
-    # expert_logits[i].shape = (tokens, num_experts)
-    tokens_per_expert, expert_scores, expert_logits = zip(*get_load_balancing_loss())
+    # expert_logits[i].shape = (tokens, num_experts)  -- only when return_zloss
+    if return_zloss:
+        tokens_per_expert, expert_scores, expert_logits = zip(*saved)
+    else:
+        tokens_per_expert, expert_scores = zip(*saved)
+        expert_logits = None
     num_layers_per_pipeline_stage = (args.num_layers // args.pipeline_model_parallel_size)
     if args.num_layers_per_virtual_pipeline_stage is not None:
         num_layers_per_pipeline_stage = args.num_layers_per_virtual_pipeline_stage
@@ -76,7 +86,6 @@ def batched_load_balancing_loss(args: Arguments):
     else:
         expert_scores = expert_scores.sum(dim=0)
     tokens_per_expert = torch.cat(tokens_per_expert).to(expert_scores.dtype)
-    expert_logits = torch.cat(expert_logits, dim=0).to(expert_scores.dtype)
 
     expected_values = num_layers_per_pipeline_stage * args.moe_num_experts
     assert tokens_per_expert.numel() == expected_values
@@ -88,8 +97,17 @@ def batched_load_balancing_loss(args: Arguments):
     scale_numerator = (args.moe_num_experts * args.moe_loss_weight)
     scale_denominator = (args.num_layers * tokens * args.moe_top_k)
     scale = scale_numerator / scale_denominator
-    zloss = (torch.log(torch.exp(expert_logits).sum(dim=-1)) ** 2).sum() / scale_denominator
-    return scale * torch.dot(tokens_per_expert, expert_scores), args.moe_zloss_weight * zloss
+    lb_loss = scale * torch.dot(tokens_per_expert, expert_scores)
+
+    if not return_zloss:
+        return lb_loss
+
+    # Z-loss: penalize large router pre-softmax logits to keep the router
+    # numerically well-behaved. Use logsumexp for stability — the naive
+    # log(exp(x).sum(-1)) form overflows for any logit > ~80 in fp32.
+    expert_logits_cat = torch.cat(expert_logits, dim=0).to(expert_scores.dtype)
+    zloss = expert_logits_cat.logsumexp(dim=-1).pow(2).sum() / scale_denominator
+    return lb_loss, args.moe_zloss_weight * zloss
 
 
 # NOTE: This class defines MoE expert computation, including expert model parallel
@@ -431,7 +449,12 @@ class ParallelMLP(torch.nn.Module):
         # Compute the experts.
         x, tokens_per_expert = self.forward_fn(x, expert_weights, top_experts)
         if self.training and self.args.moe_loss_weight > 0:
-            save_load_balancing_loss((tokens_per_expert, scores, logits))
+            # Save logits only when zloss is configured — keeps memory low for
+            # plain load-balancing-only training.
+            if self.args.moe_zloss_weight > 0:
+                save_load_balancing_loss((tokens_per_expert, scores, logits))
+            else:
+                save_load_balancing_loss((tokens_per_expert, scores))
         x = x.view(in_shape)
         if self.bias is not None:
             if self.args.return_bias:
