@@ -7,6 +7,14 @@
 #include <c10/cuda/CUDAStream.h>
 #include <torch/extension.h>
 
+// Workaround: PyTorch's hipify maps cub::DeviceScan / DeviceRadixSort /
+// DeviceSegmentedReduce to their hipcub equivalents but is missing an entry
+// for cub::DeviceHistogram. Alias it here so hipified code compiles.
+// hipcub::DeviceHistogram is a 1:1 drop-in (same signature, same semantics).
+#ifdef __HIP_PLATFORM_AMD__
+namespace cub { using hipcub::DeviceHistogram; }
+#endif
+
 #define CUDA_CALL(code)					    \
   do {                                                      \
     cudaError_t status = code;                              \
